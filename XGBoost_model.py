@@ -14,8 +14,9 @@ class OptiverModel:
         )
         
     def prepare_features(self, df):
-        """Basic feature preparation"""
-        features = df[[
+        """Enhanced feature preparation including engineered features"""
+        # Start with base features
+        base_features = df[[
             'imbalance_size',
             'imbalance_buy_sell_flag',
             'matched_size',
@@ -27,91 +28,170 @@ class OptiverModel:
             'ask_price',
             'ask_size'
         ]].copy()
-        
-        return features
-        
-    def prepare_target(self, df):
-        """Create target variable (reference_price 60 seconds ahead)"""
-        df['target'] = df.groupby('stock_id')['reference_price'].shift(-6)
-        return df
-    
+
+        # Price Movement Features
+        for window in [5, 10, 20]:
+            base_features[f'wap_momentum_{window}'] = df.groupby('stock_id')['wap'].pct_change(window).values
+            base_features[f'price_volatility_{window}'] = df.groupby('stock_id')['wap'].rolling(window).std().reset_index(0, drop=True).values
+
+        # Order Book Dynamics
+        base_features['bid_ask_spread'] = df['ask_price'] - df['bid_price']
+        base_features['bid_ask_spread_pct'] = base_features['bid_ask_spread'] / df['wap']
+        base_features['imbalance_momentum'] = df.groupby('stock_id')['imbalance_size'].diff().values
+        base_features['cumulative_imbalance'] = df.groupby('stock_id')['imbalance_size'].rolling(5).sum().reset_index(0, drop=True).values
+
+        # Volume Analysis
+        base_features['total_volume'] = df['bid_size'] + df['ask_size']
+        base_features['volume_imbalance'] = df['bid_size'] / df['ask_size']
+        for window in [5, 10]:
+            base_features[f'volume_momentum_{window}'] = df.groupby('stock_id')['matched_size'].pct_change(window).values
+            base_features[f'rolling_volume_mean_{window}'] = df.groupby('stock_id')['matched_size'].rolling(window).mean().reset_index(0, drop=True).values
+
+        # Time Features (if seconds_in_bucket exists in df)
+        if 'seconds_in_bucket' in df.columns:
+            base_features['seconds_til_close'] = 600 - df['seconds_in_bucket']
+            base_features['time_phase'] = df['seconds_in_bucket'] / 600
+
+        # Statistical Features
+        for column in ['wap', 'imbalance_size', 'matched_size']:
+            means = df.groupby('stock_id')[column].rolling(20).mean().reset_index(0, drop=True)
+            stds = df.groupby('stock_id')[column].rolling(20).std().reset_index(0, drop=True)
+            base_features[f'{column}_zscore'] = ((df[column] - means) / stds).values
+
+        # Price Relationships
+        base_features['far_near_ratio'] = df['far_price'] / df['near_price']
+        base_features['mid_price'] = (df['bid_price'] + df['ask_price']) / 2
+        base_features['mid_to_wap'] = base_features['mid_price'] / df['wap']
+
+        # Handle missing values and infinities
+        base_features = base_features.replace([np.inf, -np.inf], np.nan)
+        base_features = base_features.ffill()
+        base_features = base_features.bfill()  
+
+        return base_features
+            
     def train(self, train_df):
-        """Train the model"""
+        """Train with offline validation"""
         print("Preparing training data...")
-        df = self.prepare_target(train_df)
-        X = self.prepare_features(df)
-        y = df['target']
+        
+        # Debug BEFORE
+        print("\nBEFORE Target Calculation:")
+        print("Reference price statistics:")
+        print(train_df['reference_price'].describe())
+        
+        # Calculate target
+        train_df = calculate_target(train_df)  # Add this line
+        
+        # Debug AFTER
+        print("\nAFTER Target Calculation:")
+        print("Target statistics:")
+        print(train_df['target'].describe())
+        
+        # Prepare features
+        X = self.prepare_features(train_df)
+        y = train_df['target']
         
         # Remove rows with NA
         mask = ~y.isna()
-        X = X[mask]
+        X = X[mask].copy()
         y = y[mask]
         
+        # Split by date for validation
+        split_day = train_df['date_id'].max() - 5
+        train_dates = train_df[mask]['date_id']
+        is_val = train_dates > split_day
+        
+        X_train = X[~is_val]
+        y_train = y[~is_val]
+        X_val = X[is_val]
+        y_val = y[is_val]
+        
         print("Training model...")
-        self.model.fit(X, y)
-        print("Training completed!")
+        self.model.fit(X_train, y_train)
+        
+        # Validate offline
+        val_pred = self.model.predict(X_val)
+        val_score = mean_absolute_error(y_val, val_pred)
+        print(f"Validation MAE: {val_score:.4f}")
+
+
+def calculate_target(df):
+        # Calculate stock returns
+        df['stock_return'] = df.groupby('stock_id')['wap'].pct_change(-6)  # -6 for 60 seconds ahead
+        
+        # We need index data for proper calculation
+        # df['index_return'] = df.groupby('date_id')['index_wap'].pct_change(-6)
+        
+        # Convert to basis points
+        df['target'] = df['stock_return'] * 10000
+        
+        return df
 
 def test_with_mock_api():
     # Initialize MockAPI
-    mock_api = MockApi()
-    mock_api.input_paths = ['optiver-trading-at-the-close/example_test_files/test.csv', 'optiver-trading-at-the-close/example_test_files/sample_submission.csv']
-    mock_api.group_id_column = 'stock_id'
-    mock_api.export_group_id_column = True
+    api = MockApi()
+    api.input_paths = ['./example_test_files/test.csv', 
+                      './example_test_files/revealed_targets.csv',
+                      './example_test_files/sample_submission.csv']
+    api.group_id_column = 'time_id'
+    api.export_group_id_column = True
     
-    # Load training data and train model
+    # Load and train model
     print("Loading training data...")
-    train_df = pd.read_csv('optiver-trading-at-the-close/train.csv', nrows=100000)  # Start with subset for testing
+    train_df = pd.read_csv('train.csv')
     
     print("Initializing model...")
     model = OptiverModel()
     model.train(train_df)
     
     print("Starting prediction loop...")
+    counter = 0
     predictions = []
-
-        # Debug prints
-    print("Checking if files exist...")
-    import os
-    for path in mock_api.input_paths:
-        print(f"Path {path} exists: {os.path.exists(path)}")
-
-    # Try loading first file directly
-    print("\nTrying to read test file...")
-    test_df = pd.read_csv(mock_api.input_paths[0])
-    print("Columns in test file:", test_df.columns.tolist())
-    # Add this to your debug section:
-    print("\nChecking both files:")
-    test_df = pd.read_csv(mock_api.input_paths[0])
-    submission_df = pd.read_csv(mock_api.input_paths[1])
-    print("Test file columns:", test_df.columns.tolist())
-    print("Submission file columns:", submission_df.columns.tolist())
-    # Prediction loop
-
-
-    for test_data in mock_api.iter_test():
-        # Get current data
-        current_data = test_data[0]
+    
+    for (test, revealed_targets, sample_prediction) in api.iter_test():
+        if counter == 0:  # Only for first batch
+            print("\nFirst batch debug info:")
+            print("Test data features:")
+            print(test[['reference_price', 'wap']].describe())
+            
+            # Make predictions
+            X = model.prepare_features(test)
+            pred = model.model.predict(X)
+            
+            print("\nPrediction statistics:")
+            print(pd.Series(pred).describe())
+            
+            print("\nFirst 5 rows comparison:")
+            print(pd.DataFrame({
+                'prediction': pred[:5],
+                'reference_price': test['reference_price'].iloc[:5],
+                'wap': test['wap'].iloc[:5]
+            }))
         
-        # Prepare features
-        X = model.prepare_features(current_data)
+        # Store revealed targets if they're not empty
+        if not revealed_targets.empty and 'target' in revealed_targets.columns:
+            # Calculate MAE for previous predictions if possible
+            if predictions:
+                prev_pred = pd.concat(predictions)
+                mae = mean_absolute_error(
+                    revealed_targets['target'],
+                    prev_pred['target']
+                )
+                print(f"MAE for previous predictions: {mae:.4f}")
         
-        # Make prediction
+        # Prepare features and predict
+        X = model.prepare_features(test)
         pred = model.model.predict(X)
         
-        # Create prediction dataframe
-        pred_df = pd.DataFrame({
-            'row_id': current_data['row_id'],
-            'target': pred
-        })
+        # Format predictions
+        sample_prediction['target'] = pred
+        predictions.append(sample_prediction.copy())
         
-        # Submit prediction
-        mock_api.predict(pred_df)
-        predictions.append(pred_df)
+        # Submit predictions
+        api.predict(sample_prediction)
+        counter += 1
     
-    print("Testing completed!")
-    return predictions
+    print(f"Processed {counter} batches")
 
 if __name__ == "__main__":
-    predictions = test_with_mock_api()
-    print("First few predictions:")
-    print(predictions[0].head())
+    test_with_mock_api()
